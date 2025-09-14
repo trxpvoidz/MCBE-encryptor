@@ -67,7 +67,11 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     // Load folder
     if(folderFiles.length>0){
         for(const file of folderFiles){
-            const path = file.webkitRelativePath.replaceAll('\\','/');
+            let path = file.webkitRelativePath.replaceAll('\\','/');
+            // Normalize: remove the first folder so root matches Python
+            if(path.includes('/')){
+                path = path.split('/').slice(1).join('/');
+            }
             const content = await file.arrayBuffer();
             fileMap[path] = content;
         }
