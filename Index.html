@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minecraft Skinpack Encryptor</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+body { font-family: monospace; background:#0f1720; color:#e0e0e0; margin:0; padding:20px;}
+h1 { color:#06b6d4; }
+#log { height:300px; overflow:auto; background:#0b1220; padding:10px; margin-top:10px; border-radius:5px; white-space:pre-wrap;}
+input, button { margin:5px 0; padding:5px; width:100%; max-width:500px;}
+@media(max-width:600px){ input, button { width:100%; } }
+</style>
+</head>
+<body>
+<h1>Minecraft Skinpack Encryptor</h1>
+<input type="file" id="folderInput" webkitdirectory directory multiple />
+<br>
+<label>Pack Key (32 chars, default used if blank): <input type="text" id="packKey" maxlength="32" placeholder="s5s5ejuDru4uchuF2drUFuthaspAbepE"></label>
+<br>
+<label>Custom Manifest (optional): <input type="file" id="customManifest" accept=".json"></label>
+<br>
+<label><input type="checkbox" id="debugMode"> Debug Mode (save decrypted copies)</label>
+<br>
+<button id="encryptBtn">Encrypt Skinpack</button>
+<pre id="log"></pre>
+
+<script>
+const skipFiles = ['manifest.json','pack_icon.png'];
+const skipForce = ['contents.json','signatures.json'];
+const skipAll = [...skipFiles, ...skipForce];
+
+function log(msg){ const l = document.getElementById('log'); l.textContent += msg + '\n'; l.scrollTop = l.scrollHeight; }
+
+function randomKey32(){
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let key = '';
+    for(let i=0;i<32;i++) key += chars.charAt(Math.floor(Math.random()*chars.length));
+    return key;
+}
+
+async function sha256Base64(data){
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    return btoa(String.fromCharCode(...new Uint8Array(hash)));
+}
+
+async function aesCFB8Encrypt(data, keyStr){
+    const keyBytes = new TextEncoder().encode(keyStr);
+    const iv = keyBytes.slice(0,16);
+    const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, 'AES-CFB', true, ['encrypt']);
+    return new Uint8Array(await crypto.subtle.encrypt({name:'AES-CFB', iv}, cryptoKey, data));
+}
+
+document.getElementById('encryptBtn').addEventListener('click', async ()=>{
+    const files = document.getElementById('folderInput').files;
+    let packKey = document.getElementById('packKey').value;
+    const debug = document.getElementById('debugMode').checked;
+    const customManifestFile = document.getElementById('customManifest').files[0] || null;
+
+    if(!packKey) packKey = 's5s5ejuDru4uchuF2drUFuthaspAbepE';
+    if(packKey.length !==32){ alert('Pack key must be 32 chars'); return; }
+
+    const zip = new JSZip();
+    const fileMap = {};
+
+    for(const file of files){
+        const path = file.webkitRelativePath.replaceAll('\\','/');
+        const content = await file.arrayBuffer();
+        fileMap[path] = content;
+    }
+
+    // Handle manifest.json replacement
+    if(customManifestFile){
+        const customManifestData = await customManifestFile.arrayBuffer();
+        fileMap['manifest.json'] = customManifestData;
+        log('Custom manifest loaded.');
+    }
+
+    const manifestData = fileMap['manifest.json'];
+    if(!manifestData){ alert('manifest.json missing!'); return; }
+    const manifestJSON = JSON.parse(new TextDecoder().decode(manifestData));
+    const uuid = manifestJSON.header.uuid;
+    if(!uuid || uuid.length!==36){ alert('manifest.json UUID invalid'); return; }
+
+    const contentsJSON = {version:1, content:[]};
+
+    for(const path in fileMap){
+        const content = fileMap[path];
+        let encrypt = true;
+        let doNotAdd = false;
+
+        if(path.startsWith('texts/')) encrypt=false;
+        if(skipFiles.includes(path)) encrypt=false;
+        if(skipForce.includes(path)){ encrypt=false; doNotAdd=true; }
+
+        if(encrypt){
+            const key = randomKey32();
+            const enc = await aesCFB8Encrypt(new Uint8Array(content), key);
+            zip.file(path, enc);
+            contentsJSON.content.push({key,path});
+            log(`Encrypted ${path} with key ${key}`);
+        } else {
+            zip.file(path, content);
+            if(!doNotAdd){
+                contentsJSON.content.push({path});
+                log(`Skipped ${path}`);
+            } else {
+                log(`Unadded ${path}`);
+            }
+        }
+    }
+
+    // signatures.json
+    const sigHash = await sha256Base64(fileMap['manifest.json']);
+    const sigJSON = [{hash:sigHash, path:'manifest.json'}];
+    const sigKey = randomKey32();
+    const sigEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(sigJSON, null,0)), sigKey);
+    zip.file('signatures.json', sigEnc);
+    contentsJSON.content.push({key:sigKey, path:'signatures.json'});
+    log('signatures.json encrypted');
+
+    // contents.json encryption
+    const contentsEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(contentsJSON, null,0)), packKey);
+    const header = new Uint8Array(256);
+    const headerPrefix = [0x00,0x00,0x00,0x00,0xfc,0xb9,0xcf,0x9b,0,0,0,0,0,0,0,0,0x24];
+    header.set(headerPrefix,0);
+    const uuidBytes = new TextEncoder().encode(uuid);
+    header.set(uuidBytes, headerPrefix.length);
+    const finalContents = new Uint8Array([...header,...contentsEnc]);
+    zip.file('contents.json', finalContents);
+    log('contents.json encrypted');
+
+    // Debug mode files
+    if(debug){
+        zip.file('contentsDecrypted.json', new TextEncoder().encode(JSON.stringify(contentsJSON,null,2)));
+        zip.file('signaturesDecrypted.json', new TextEncoder().encode(JSON.stringify(sigJSON,null,2)));
+        log('Debug copies included.');
+    }
+
+    const blob = await zip.generateAsync({type:'blob'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download='EncryptedSkinpack.zip'; a.click();
+    log('Encryption complete! Download started.');
+});
+</script>
+</body>
+</html>
