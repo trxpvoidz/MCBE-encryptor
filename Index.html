@@ -52,6 +52,14 @@ async function aesCFB8Encrypt(data, keyStr){
     return new Uint8Array(await crypto.subtle.encrypt({name:'AES-CFB', iv}, cryptoKey, data));
 }
 
+// Normalize paths so root matches Python
+function normalizePath(path){
+    path = path.replaceAll('\\','/');
+    const parts = path.split('/');
+    if(parts.length > 1) return parts.slice(1).join('/');
+    return path;
+}
+
 document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     const folderFiles = document.getElementById('folderInput').files;
     const zipFile = document.getElementById('zipInput').files[0];
@@ -67,11 +75,7 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     // Load folder
     if(folderFiles.length>0){
         for(const file of folderFiles){
-            let path = file.webkitRelativePath.replaceAll('\\','/');
-            // Normalize: remove the first folder so root matches Python
-            if(path.includes('/')){
-                path = path.split('/').slice(1).join('/');
-            }
+            const path = normalizePath(file.webkitRelativePath);
             const content = await file.arrayBuffer();
             fileMap[path] = content;
         }
@@ -83,8 +87,9 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
         await Promise.all(Object.keys(zip.files).map(async path=>{
             const fileObj = zip.files[path];
             if(!fileObj.dir){
+                const normPath = normalizePath(path);
                 const content = await fileObj.async('arraybuffer');
-                fileMap[path.replaceAll('\\','/')] = content;
+                fileMap[normPath] = content;
             }
         }));
     }
@@ -92,10 +97,7 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
 
     // Manifest detection
     let manifestPath = Object.keys(fileMap).find(p=>p.endsWith('manifest.json'));
-    if(!manifestPath){
-        alert('manifest.json missing!');
-        return;
-    }
+    if(!manifestPath){ alert('manifest.json missing!'); return; }
 
     // Replace manifest if provided
     if(customManifestFile){
@@ -148,16 +150,20 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     contentsJSON.content.push({key:sigKey, path:'signatures.json'});
     log('signatures.json encrypted');
 
-    // contents.json
+    // contents.json with Python-compatible header
     const contentsEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(contentsJSON, null,0)), packKey);
-    const header = new Uint8Array(256);
-    const headerPrefix = [0x00,0x00,0x00,0x00,0xfc,0xb9,0xcf,0x9b,0,0,0,0,0,0,0,0,0x24];
-    header.set(headerPrefix,0);
+    const empty = new Uint8Array(256);
+    const headerByte = new Uint8Array([0xfc,0xb9,0xcf,0x9b,0,0,0,0,0,0,0,0,0,0,0,0,0x24]);
     const uuidBytes = new TextEncoder().encode(uuid);
-    header.set(uuidBytes, headerPrefix.length);
-    const finalContents = new Uint8Array([...header,...contentsEnc]);
+    const headerFinal = new Uint8Array([
+        ...empty.slice(0,4),        // empty[:4]
+        ...headerByte,               // headerByte
+        ...uuidBytes,                // uuid
+        ...empty.slice(53)           // empty[53:]
+    ]);
+    const finalContents = new Uint8Array([...headerFinal,...contentsEnc]);
     zipOut.file('contents.json', finalContents);
-    log('contents.json encrypted');
+    log('contents.json encrypted (Python-compatible header)');
 
     if(debug){
         zipOut.file('contentsDecrypted.json', new TextEncoder().encode(JSON.stringify(contentsJSON,null,2)));
