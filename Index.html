@@ -15,7 +15,8 @@ input, button { margin:5px 0; padding:5px; width:100%; max-width:500px;}
 </head>
 <body>
 <h1>Minecraft Skinpack Encryptor</h1>
-<input type="file" id="folderInput" webkitdirectory directory multiple />
+<label>Folder Input: <input type="file" id="folderInput" webkitdirectory directory multiple></label>
+<label>or ZIP Input: <input type="file" id="zipInput" accept=".zip"></label>
 <br>
 <label>Pack Key (32 chars, default used if blank): <input type="text" id="packKey" maxlength="32" placeholder="s5s5ejuDru4uchuF2drUFuthaspAbepE"></label>
 <br>
@@ -29,7 +30,6 @@ input, button { margin:5px 0; padding:5px; width:100%; max-width:500px;}
 <script>
 const skipFiles = ['manifest.json','pack_icon.png'];
 const skipForce = ['contents.json','signatures.json'];
-const skipAll = [...skipFiles, ...skipForce];
 
 function log(msg){ const l = document.getElementById('log'); l.textContent += msg + '\n'; l.scrollTop = l.scrollHeight; }
 
@@ -53,37 +53,61 @@ async function aesCFB8Encrypt(data, keyStr){
 }
 
 document.getElementById('encryptBtn').addEventListener('click', async ()=>{
-    const files = document.getElementById('folderInput').files;
-    let packKey = document.getElementById('packKey').value;
-    const debug = document.getElementById('debugMode').checked;
+    const folderFiles = document.getElementById('folderInput').files;
+    const zipFile = document.getElementById('zipInput').files[0];
     const customManifestFile = document.getElementById('customManifest').files[0] || null;
+    const debug = document.getElementById('debugMode').checked;
 
+    let packKey = document.getElementById('packKey').value;
     if(!packKey) packKey = 's5s5ejuDru4uchuF2drUFuthaspAbepE';
-    if(packKey.length !==32){ alert('Pack key must be 32 chars'); return; }
+    if(packKey.length!==32){ alert('Pack key must be 32 chars'); return; }
 
-    const zip = new JSZip();
-    const fileMap = {};
+    let fileMap = {};
 
-    for(const file of files){
-        const path = file.webkitRelativePath.replaceAll('\\','/');
-        const content = await file.arrayBuffer();
-        fileMap[path] = content;
+    // Load folder
+    if(folderFiles.length>0){
+        for(const file of folderFiles){
+            const path = file.webkitRelativePath.replaceAll('\\','/');
+            const content = await file.arrayBuffer();
+            fileMap[path] = content;
+        }
+    }
+    // Load zip
+    else if(zipFile){
+        const zipData = await zipFile.arrayBuffer();
+        const zip = await JSZip.loadAsync(zipData);
+        await Promise.all(Object.keys(zip.files).map(async path=>{
+            const fileObj = zip.files[path];
+            if(!fileObj.dir){
+                const content = await fileObj.async('arraybuffer');
+                fileMap[path.replaceAll('\\','/')] = content;
+            }
+        }));
+    }
+    else { alert('Select a folder or zip file.'); return; }
+
+    // Manifest detection
+    let manifestPath = Object.keys(fileMap).find(p=>p.endsWith('manifest.json'));
+    if(!manifestPath){
+        alert('manifest.json missing!');
+        return;
     }
 
-    // Handle manifest.json replacement
+    // Replace manifest if provided
     if(customManifestFile){
         const customManifestData = await customManifestFile.arrayBuffer();
-        fileMap['manifest.json'] = customManifestData;
+        fileMap[manifestPath] = customManifestData;
         log('Custom manifest loaded.');
     }
 
-    const manifestData = fileMap['manifest.json'];
-    if(!manifestData){ alert('manifest.json missing!'); return; }
+    const manifestData = fileMap[manifestPath];
     const manifestJSON = JSON.parse(new TextDecoder().decode(manifestData));
     const uuid = manifestJSON.header.uuid;
     if(!uuid || uuid.length!==36){ alert('manifest.json UUID invalid'); return; }
+    log('Manifest loaded from: ' + manifestPath);
 
     const contentsJSON = {version:1, content:[]};
+    const zipOut = new JSZip();
 
     for(const path in fileMap){
         const content = fileMap[path];
@@ -97,11 +121,11 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
         if(encrypt){
             const key = randomKey32();
             const enc = await aesCFB8Encrypt(new Uint8Array(content), key);
-            zip.file(path, enc);
+            zipOut.file(path, enc);
             contentsJSON.content.push({key,path});
             log(`Encrypted ${path} with key ${key}`);
         } else {
-            zip.file(path, content);
+            zipOut.file(path, content);
             if(!doNotAdd){
                 contentsJSON.content.push({path});
                 log(`Skipped ${path}`);
@@ -112,15 +136,15 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     }
 
     // signatures.json
-    const sigHash = await sha256Base64(fileMap['manifest.json']);
+    const sigHash = await sha256Base64(fileMap[manifestPath]);
     const sigJSON = [{hash:sigHash, path:'manifest.json'}];
     const sigKey = randomKey32();
     const sigEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(sigJSON, null,0)), sigKey);
-    zip.file('signatures.json', sigEnc);
+    zipOut.file('signatures.json', sigEnc);
     contentsJSON.content.push({key:sigKey, path:'signatures.json'});
     log('signatures.json encrypted');
 
-    // contents.json encryption
+    // contents.json
     const contentsEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(contentsJSON, null,0)), packKey);
     const header = new Uint8Array(256);
     const headerPrefix = [0x00,0x00,0x00,0x00,0xfc,0xb9,0xcf,0x9b,0,0,0,0,0,0,0,0,0x24];
@@ -128,20 +152,20 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     const uuidBytes = new TextEncoder().encode(uuid);
     header.set(uuidBytes, headerPrefix.length);
     const finalContents = new Uint8Array([...header,...contentsEnc]);
-    zip.file('contents.json', finalContents);
+    zipOut.file('contents.json', finalContents);
     log('contents.json encrypted');
 
-    // Debug mode files
     if(debug){
-        zip.file('contentsDecrypted.json', new TextEncoder().encode(JSON.stringify(contentsJSON,null,2)));
-        zip.file('signaturesDecrypted.json', new TextEncoder().encode(JSON.stringify(sigJSON,null,2)));
+        zipOut.file('contentsDecrypted.json', new TextEncoder().encode(JSON.stringify(contentsJSON,null,2)));
+        zipOut.file('signaturesDecrypted.json', new TextEncoder().encode(JSON.stringify(sigJSON,null,2)));
         log('Debug copies included.');
     }
 
-    const blob = await zip.generateAsync({type:'blob'});
-    const url = URL.createObjectURL(blob);
+    const blob = await zipOut.generateAsync({type:'blob'});
     const a = document.createElement('a');
-    a.href = url; a.download='EncryptedSkinpack.zip'; a.click();
+    a.href = URL.createObjectURL(blob);
+    a.download = 'EncryptedSkinpack.zip';
+    a.click();
     log('Encryption complete! Download started.');
 });
 </script>
