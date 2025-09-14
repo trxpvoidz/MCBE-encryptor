@@ -31,7 +31,12 @@ input, button { margin:5px 0; padding:5px; width:100%; max-width:500px;}
 const skipFiles = ['manifest.json','pack_icon.png'];
 const skipForce = ['contents.json','signatures.json'];
 
-function log(msg){ const l = document.getElementById('log'); l.textContent += msg + '\n'; l.scrollTop = l.scrollHeight; }
+function log(msg){ 
+    const l = document.getElementById('log'); 
+    l.textContent += msg + '\n'; 
+    l.scrollTop = l.scrollHeight; 
+    return new Promise(r=>setTimeout(r,0)); // allow UI update
+}
 
 function randomKey32(){
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -103,18 +108,19 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     if(customManifestFile){
         const customManifestData = await customManifestFile.arrayBuffer();
         fileMap[manifestPath] = customManifestData;
-        log('Custom manifest loaded.');
+        await log('Custom manifest loaded.');
     }
 
     const manifestData = fileMap[manifestPath];
     const manifestJSON = JSON.parse(new TextDecoder().decode(manifestData));
     const uuid = manifestJSON.header.uuid;
     if(!uuid || uuid.length!==36){ alert('manifest.json UUID invalid'); return; }
-    log('Manifest loaded from: ' + manifestPath);
+    await log('Manifest loaded from: ' + manifestPath);
 
     const contentsJSON = {version:1, content:[]};
     const zipOut = new JSZip();
 
+    // Encrypt / add files with live logging
     for(const path in fileMap){
         const content = fileMap[path];
         let encrypt = true;
@@ -124,21 +130,24 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
         if(skipFiles.includes(path)) encrypt=false;
         if(skipForce.includes(path)){ encrypt=false; doNotAdd=true; }
 
+        let encData;
         if(encrypt){
             const key = randomKey32();
-            const enc = await aesCFB8Encrypt(new Uint8Array(content), key);
-            zipOut.file(path, enc);
-            contentsJSON.content.push({key,path});
-            log(`Encrypted ${path} with key ${key}`);
+            encData = await aesCFB8Encrypt(new Uint8Array(content), key);
+            contentsJSON.content.push({key, path});
+            await log(`Encrypted ${path} with key ${key}`);
         } else {
-            zipOut.file(path, content);
+            encData = new Uint8Array(content);
             if(!doNotAdd){
                 contentsJSON.content.push({path});
-                log(`Skipped ${path}`);
+                await log(`Skipped ${path}`);
             } else {
-                log(`Unadded ${path}`);
+                await log(`Unadded ${path}`);
             }
         }
+
+        zipOut.file(path, encData);
+        await new Promise(r=>setTimeout(r,0)); // yield to UI
     }
 
     // signatures.json
@@ -148,7 +157,7 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     const sigEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(sigJSON, null,0)), sigKey);
     zipOut.file('signatures.json', sigEnc);
     contentsJSON.content.push({key:sigKey, path:'signatures.json'});
-    log('signatures.json encrypted');
+    await log('signatures.json encrypted');
 
     // contents.json with Python-compatible header
     const contentsEnc = await aesCFB8Encrypt(new TextEncoder().encode(JSON.stringify(contentsJSON, null,0)), packKey);
@@ -156,27 +165,28 @@ document.getElementById('encryptBtn').addEventListener('click', async ()=>{
     const headerByte = new Uint8Array([0xfc,0xb9,0xcf,0x9b,0,0,0,0,0,0,0,0,0,0,0,0,0x24]);
     const uuidBytes = new TextEncoder().encode(uuid);
     const headerFinal = new Uint8Array([
-        ...empty.slice(0,4),        // empty[:4]
-        ...headerByte,               // headerByte
-        ...uuidBytes,                // uuid
-        ...empty.slice(53)           // empty[53:]
+        ...empty.slice(0,4),        
+        ...headerByte,               
+        ...uuidBytes,                
+        ...empty.slice(53)           
     ]);
     const finalContents = new Uint8Array([...headerFinal,...contentsEnc]);
     zipOut.file('contents.json', finalContents);
-    log('contents.json encrypted (Python-compatible header)');
+    await log('contents.json encrypted (Python-compatible header)');
 
     if(debug){
         zipOut.file('contentsDecrypted.json', new TextEncoder().encode(JSON.stringify(contentsJSON,null,2)));
         zipOut.file('signaturesDecrypted.json', new TextEncoder().encode(JSON.stringify(sigJSON,null,2)));
-        log('Debug copies included.');
+        await log('Debug copies included.');
     }
 
+    await log('Generating final ZIP...');
     const blob = await zipOut.generateAsync({type:'blob'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'EncryptedSkinpack.zip';
     a.click();
-    log('Encryption complete! Download started.');
+    await log('Encryption complete! Download started.');
 });
 </script>
 </body>
